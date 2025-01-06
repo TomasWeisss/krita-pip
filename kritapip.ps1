@@ -245,14 +245,36 @@ switch ($Command.ToLower())
     {
         $vendorDir = Get-VendorDirectory -PluginName $Plugin `
                                          -Create $False
-
-        if (-not (Test-Path $vendorDir)) 
-        {
-            return
-        }
+        if (-not (Test-Path $vendorDir)) { return }
 
         Write-Host "Installed packages:"
-        Get-ChildItem $vendorDir -Directory | ForEach-Object { Write-Host " - $($_.Name)" }
+        Write-Host ("Name".PadRight(30) + "Version")
+        Write-Host ("----".PadRight(30) + "-------")
+
+        foreach ($dir in (Get-ChildItem $vendorDir -Directory)) 
+        {
+            # Attempt to extract name and version from directory name
+            # e.g. "requests-2.28.1.dist-info"
+            if ($dir.Name -notmatch ".dist-info$")
+            { continue }
+
+            if ($dir.Name -match "^([^\.]+)-(\d[\w\.]+).dist-info") 
+            {
+                $name    = $matches[1]
+                $version = $matches[2]
+                # Trim any trailing `.dist-info` if present
+                $version = $version -replace "\.dist-info$", ""
+            }
+            else 
+            {
+                # fallback: unknown name/version
+                $name    = $dir.Name
+                $version = "?"
+            }
+
+            $line = $name.PadRight(30) + $version
+            Write-Host $line
+        }
     }
 
     default 
