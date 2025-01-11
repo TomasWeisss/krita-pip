@@ -24,6 +24,7 @@ $Platform="win_amd64"
 
 
 # Functions
+#region Helper functions
 function Get-KeyValue 
 {
     # https://stackoverflow.com/questions/33520699/iterating-through-a-json-file-powershell
@@ -38,6 +39,110 @@ function Get-KeyValue
     }
 }
 
+function Get-PackageInfo
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Filename
+    )
+
+
+    # Pattern:
+    #   ([^-]+)    Distribution
+    #   -
+    #   ([^-]+)    Version   
+    #   (-(\d+))?  Build (optional)
+    #   -
+    #   ([^-]+)    ABI
+    #   -
+    #   ([^-]+)    Platform
+    #   .whl
+    if ($Filename -notmatch "(?<distribution>[^-]+)-(?<version>[^-]+)(-(?<build>\d+))?-(?<python_tag>[^-]+)-(?<abi_tag>[^-]+)-(?<platform_tag>[^-]+)\.whl")
+    {
+        Write-Error "Failed to parse package: '$Filename'"
+        return $null
+    }
+
+    return [PSCustomObject]@{
+        Distribution = $matches['distribution']
+        Version = $matches['version']
+        Python = $matches['python_tag']
+        Abi = $matches['abi_tag']
+        Platform = $matches['platform_tag']
+    }
+}
+
+function Test-VersionRequirement 
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Version,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Requirement
+    )
+
+    [System.Version]$actualVersion
+    try { $actualVersion = [System.Version] $PythonVersion }
+    catch 
+    {
+        Write-Error "Invalid version: '$Version'"
+        return $false
+    }
+
+    # Parse the requirement string.
+    # Allowed operators: >=, <=, ==, >, <, or =.
+    # No operator assumed to be ==.
+    #
+    # Pattern explanation:
+    #     ^(?<op>>=|<=|==|>|<|=)? - match optional operator at start
+    #     \s*                    - optional whitespace
+    #     (?<reqVer>\d+(\.\d+){1,2}) - match a version with 2 or 3 segments, like 3.7 or 3.10
+    #     $                       - end of string
+    if ($Requirement -match '^(?<op>>=|<=|==|>|<|=)?\s*(?<reqVer>\d+(\.\d+){1,2})$') 
+    {
+        # Get operator
+        $op = $matches['op']
+        if (-not $op) 
+            { $op = '==' }
+
+        # Parse required version
+        $requiredStr = $matches['reqVer']
+        [System.Version]$requiredVersion
+        try 
+            { $requiredVersion = [System.Version] $requiredStr }
+        catch 
+        {
+            Write-Error "Invalid requirement version: '$requiredStr'"
+            return $false
+        }
+
+        # Compare using the operator
+        switch ($op) 
+        {
+            '==' { return $actualVersion -eq $requiredVersion }
+            '='  { return $actualVersion -eq $requiredVersion }
+            '>=' { return $actualVersion -ge $requiredVersion }
+            '<=' { return $actualVersion -le $requiredVersion }
+            '>'  { return $actualVersion -gt $requiredVersion }
+            '<'  { return $actualVersion -lt $requiredVersion }
+
+            default 
+            {
+                Write-Error "Unsupported operator: '$op'"
+                return $false
+            }
+        }
+    }
+    else 
+    {
+        Write-Error "Unsupported requirement format: '$Requirement'"
+        return $false
+    }
+}
+
 function Resolve-PackageVersion 
 {
     param (
@@ -49,6 +154,7 @@ function Resolve-PackageVersion
         [string]$Platform,        
         [string]$RequestedVersion 
     )
+
 
     $candidates = $MetadataJson.releases | Get-KeyValue | ForEach-Object { $_.Key } | Sort-Object -Descending
 
@@ -70,6 +176,7 @@ function Resolve-PackageVersion
         }
     }
 
+
     # Find specific package
     foreach ($candidate in $candidates) 
     {
@@ -77,16 +184,31 @@ function Resolve-PackageVersion
 
         foreach ($releaseObject in $releaseObjects) 
         {
-            if ($releaseObject.python_version -eq $PythonVersion) 
+            # Filter for wheels only
+            if ($releaseObject.filename -notmatch ".whl$")
+                { continue }
+
+            # Filter by python version
+            if ($releaseObject.python_version -match "^cp(\d)(\d+)$")
             {
-                $filenameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($releaseObject.filename)
-                if ($filenameWithoutExt -match "$Platform$") 
-                {
-                    return [PSCustomObject]@{
-                        Version = $candidate
-                        Url     = $releaseObject.url
-                        File    = $releaseObject.filename
-                    }
+                $requiredPython = "$($matches[1]).$($matches[2])"
+            }
+            elseif ($releaseObject.python_version -match "py3|py2.py3")
+            {
+                $requiredPython = $releaseObject.requires_python
+            }
+            if (!(Test-VersionRequirement -Version $PythonVersion -Requirement $requiredPython))
+                { continue }
+
+            # Filter by platform
+            $releaseInfo = Get-PackageInfo $releaseObject.filename
+            if ($releaseInfo.Platform -eq $Platform -or $releaseInfo.Platform -eq "any")
+            {
+                return [PSCustomObject]@{
+                    Filename = $releaseObject.filename
+                    Info = $releaseInfo
+                    Url = $releaseObject.url
+                    Size    = $releaseObject.size
                 }
             }
         }
@@ -120,18 +242,7 @@ function Get-VendorDirectory
 
     return $vendorDir
 }
-
-
-# Convert "3.10" => "cp310"
-if ($Python -match "^(\d+)\.(\d+)")
-{
-    $pythonVersion = "cp" + $matches[1] + $matches[2]
-} 
-else 
-{
-    Write-Host "Invalid Python version format: $Python"
-    return
-}
+#endregion
 
 
 # Execute command
@@ -157,6 +268,7 @@ switch ($Command.ToLower())
         }
 
         # 2) Fetch PyPI metadata
+        Write-Host "Colleting $packageName"
         try 
         {
             $json = (Invoke-WebRequest "https://pypi.org/pypi/$packageName/json").Content | ConvertFrom-Json
@@ -168,31 +280,29 @@ switch ($Command.ToLower())
         }
 
         # 3) Resolve best matching version
-        $match = Resolve-PackageVersion -MetadataJson $json `
-                                        -PythonVersion $pythonVersion `
+        $matchedPackage = Resolve-PackageVersion -MetadataJson $json `
+                                        -PythonVersion $Python `
                                         -Platform $Platform `
                                         -RequestedVersion $requestedVersion
-        if (-not $match) 
+        if (-not $matchedPackage) 
         {
             return
         }
 
-        $foundVersion = $match.Version
-        $urlToDownload = $match.Url
-        $filename = $match.File
+        $urlToDownload = $matchedPackage.Url
+        $filename = $matchedPackage.Filename
+        $fileSize = [Math]::Round($matchedPackage.Size / 1MB, 1)
+        $packageInfo = $matchedPackage.Info
 
         # 4) Prepare vendor directory
         $vendorDir = Get-VendorDirectory -PluginName $Plugin `
                                          -Create $True
 
-        Write-Host "Found version $foundVersion => $filename"
-        Write-Host "Downloading from:"
-        Write-Host "  $urlToDownload"
-
         # 5) Download
+        Write-Host "  Downloading $filename ($fileSize MB)"
         $downloadPath = Join-Path $vendorDir $filename
         $webClient = New-Object System.Net.WebClient
-        Write-Host "Downloading." -NoNewline
+        Write-Host "    Downloading." -NoNewline
         $webClient.DownloadFileAsync([uri]$urlToDownload, $downloadPath)
         while ($webClient.IsBusy) 
         {
@@ -204,12 +314,13 @@ switch ($Command.ToLower())
         # 6) Extract
         $zipPath = [System.IO.Path]::ChangeExtension($downloadPath, ".zip")
         Rename-Item -Path $downloadPath -NewName $zipPath
-        Write-Host "Extracting $filename to $vendorDir"
+        Write-Host "Installing collected packages: $($packageInfo.Distribution)"
+        Write-Host "  Extracting to $vendorDir"
         Expand-Archive -Path $zipPath -DestinationPath $vendorDir -Force
 
         Remove-Item -Path $downloadPath -ErrorAction Ignore
         Remove-Item -Path $zipPath -ErrorAction Ignore
-        Write-Host "Done."
+        Write-Host "Successfully installed $($packageInfo.Distribution)-$($packageInfo.Version)"
     }
 
     "uninstall" 
